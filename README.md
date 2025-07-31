@@ -1,6 +1,6 @@
 # Polkadot Cross-Consensus Message (XCM) Format
 
-**Version 4.**
+**Version 5.**
 **Authors: Gavin Wood.**
 
 This document details the message format for Polkadot-based message passing between chains. It describes the formal data format, any environmental data which may be additionally required and the corresponding meaning of the datagrams.
@@ -107,6 +107,7 @@ The registers are named:
 - *Refunded Weight*
 - *Transact Status*
 - *Topic*
+- *Fees*
 
 ### **3.1** Programme
 
@@ -174,6 +175,11 @@ Of type `Option<[u8; 32]>`, initialized to `None`.
 
 Expresses an arbitrary topic of an XCM.  This value can be set to anything, and is used as part of `XcmContext`.
 
+### **3.12** Fees
+
+Of type `Assets`, initialized to an empty set (i.e. no assets).
+
+Similar to the holding register, but containing only assets destined for fee payment in their entirety.
 
 ## **4** Basic XCVM Operation
 
@@ -212,7 +218,7 @@ The instructions, in order, are:
 - `QueryResponse = 3 {query_id: Compact<QueryId>, response: Response, max_weight: Weight, querier: Option<Location> }`
 - `TransferAsset = 4 { assets: Assets, beneficiary: Location }`
 - `TransferReserveAsset = 5 { assets: Assets, dest: Location, xcm: Xcm<()> }`
-- `Transact = 6 { origin_kind: OriginKind, require_weight_at_most: Weight, call: DoubleEncoded<Call> }`
+- `Transact = 6 { origin_kind: OriginKind, fallback_max_weight: Option<Weight>, call: DoubleEncoded<Call> }`
 - `HrmpNewChannelOpenRequest = 7 { sender: Compact<u32>, max_message_size: Compact<u32>, max_capacity: Compact<u32> }`
 - `HrmpChannelAccepted = 8 { recipient: Compact<u32> }`
 - `HrmpChannelClosing = 9 { initiator: Compact<u32>, sender: Compact<u32>, recipient: Compact<u32> }`
@@ -254,6 +260,22 @@ The instructions, in order, are:
 - `ClearTopic = 45`
 - `AliasOrigin = 46 (Location)`
 - `UnpaidExecution = 47 { weight_limit: WeightLimit, check_origin: Option<Location> }`
+- `PayFees = 48 { asset: Asset }`
+- `InitiateTransfer = 49 { destination: Location, remote_fees: Option<AssetTransferFilter>, preserve_origin: bool, assets: BoundedVec<AssetTransferFilter, MaxAssetTransferFilters>, remote_xcm: Xcm<()> }`
+- `ExecuteWithOrigin = 50 { descendant_origin: Option<InteriorLocation>, xcm: Xcm<Call> }`
+- `SetHints = 51 { hints: BoundedVec<Hint, NumHints> }`
+
+`AssetTransferFilter` is a type that can be one of the following:
+
+- `Teleport = 0 (AssetFilter)`
+- `ReserveDeposit = 1 (AssetFilter)`
+- `ReserveWithdraw = 2 (AssetFilter)`
+
+The hints mentioned in `SetHints` are:
+
+- `AssetClaimer = 0 { location: Location }`
+
+Therefore `NumHints` is 1.
 
 ### Notes on terminology
 
@@ -398,7 +420,7 @@ The Transact Status Register is set according to the result of dispatching the c
 Operands:
 
 - `origin_kind: OriginKind`: The means of expressing the message origin as a dispatch origin.
-- `require_weight_at_most: Weight`: The weight of `call`; this should be at least the chain's calculated weight and will be used in the weight determination arithmetic.
+- `fallback_max_weight: Option<Weight>`: An optional max weight the `call` can have; this should be at least the chain's calculated weight and will be used in the weight determination arithmetic. It's optional for backwards compatibility. Not needed most of the time since the destination can get the weight for the call.
 - `call: DoubleEncoded<Call>`: The encoded transaction to be applied.
 
 Kind: *Command*.
@@ -1050,6 +1072,105 @@ Kind: *Indication*
 Errors: 
 - `BadOrigin`
 
+### [`PayFees`](https://github.com/paritytech/polkadot-sdk/blob/7304295748b1d85eb9fc2b598eba43d9f7971f22/polkadot/xcm/src/v5/mod.rs#L1058)
+
+Takes an asset, uses it to pay for execution and puts the rest in the fees register.
+
+The successor to `BuyExecution`.
+Defined in [Fellowship RFC 105](https://github.com/polkadot-fellows/RFCs/pull/105).
+Subsequent `PayFees` after the first one are noops.
+
+Operands:
+
+- `asset: Asset`: The asset used to pay for fees.
+
+Kind: *Command*.
+
+### [`InitiateTransfer`](https://github.com/paritytech/polkadot-sdk/blob/7304295748b1d85eb9fc2b598eba43d9f7971f22/polkadot/xcm/src/v5/mod.rs#L1106)
+
+Initiates cross-chain transfer as follows:
+
+Assets in the holding register are matched using the given list of `AssetTransferFilter`s, they are then transferred based on their specified transfer type:
+
+- teleport: burn local assets and append a `ReceiveTeleportedAsset` XCM instruction to the
+  XCM program to be sent onward to the `destination` location,
+- reserve deposit: place assets under the ownership of `destination` within this consensus
+  system (i.e. its sovereign account), and append a `ReserveAssetDeposited` XCM instruction
+  to the XCM program to be sent onward to the `destination` location,
+- reserve withdraw: burn local assets and append a `WithdrawAsset` XCM instruction to the
+  XCM program to be sent onward to the `destination` location,
+
+The onward XCM is then appended a `ClearOrigin` to allow safe execution of any following
+custom XCM instructions provided in `remote_xcm`.
+The onward XCM also contains either a `PayFees` or `UnpaidExecution` instruction based
+on the presence of the `remote_fees` parameter (see below).
+If an XCM program requires going through multiple hops, it can compose this instruction to
+be used at every chain along the path, describing that specific leg of the flow.
+
+Operands:
+
+- `destination`: The location of the program next hop.
+- `remote_fees`: If set to `Some(asset_xfer_filter)`, the single asset matching
+  `asset_xfer_filter` in the holding register will be transferred first in the remote XCM
+  program, followed by a `PayFees(fee)`, then rest of transfers follow. This guarantees
+  `remote_xcm` will successfully pass a `AllowTopLevelPaidExecutionFrom` barrier. If set to
+  `None`, a `UnpaidExecution` instruction is appended instead. Please note that these
+  assets are **reserved** for fees, they are sent to the fees register rather than holding.
+  Best practice is to only add here enough to cover fees, and transfer the rest through the
+  `assets` parameter.
+- `preserve_origin`: Specifies whether the original origin should be preserved or cleared,
+  using the instructions `AliasOrigin` or `ClearOrigin` respectively.
+- `assets`: List of asset filters matched against existing assets in holding. These are
+  transferred over to `destination` using the specified transfer type, and deposited to
+  holding on `destination`.
+- `remote_xcm`: Custom instructions that will be executed on the `destination` chain. Note
+  that these instructions will be executed after a `ClearOrigin` so their origin will be
+  `None`.
+
+Safety: No concerns.
+
+Kind: *Command*.
+
+Errors:
+
+- `UntrustedTeleportLocation`
+- `UntrustedReserveLocation`
+- `FailedToTransactAsset`
+
+### [`ExecuteWithOrigin`](https://github.com/paritytech/polkadot-sdk/blob/7304295748b1d85eb9fc2b598eba43d9f7971f22/polkadot/xcm/src/v5/mod.rs#L1131)
+
+Executes inner `xcm` with origin set to the provided `descendant_origin`. Once the inner
+`xcm` is executed, the original origin (the one active for this instruction) is restored.
+
+Operands:
+
+- `descendant_origin`: The origin that will be used during the execution of the inner
+  `xcm`. If set to `None`, the inner `xcm` is executed with no origin. If set to `Some(o)`,
+  the inner `xcm` is executed as if there was a `DescendOrigin(o)` executed before it, and
+  runs the inner xcm with origin: `original_origin.append_with(o)`.
+- `xcm`: Inner instructions that will be executed with the origin modified according to
+  `descendant_origin`.
+
+Kind: *Command*.
+
+Errors:
+- `BadOrigin`
+
+### [`SetHints`](https://github.com/paritytech/polkadot-sdk/blob/7304295748b1d85eb9fc2b598eba43d9f7971f22/polkadot/xcm/src/v5/mod.rs#L1141)
+
+Set hints for XCM execution.
+
+These hints change the behaviour of the XCM program they are present in.
+
+Operands:
+
+- `hints`: A bounded vector of `ExecutionHint`, specifying the different hints that will
+be activated.
+
+Safety: No concerns.
+
+Kind: *Command*.
+
 ## **6** Universal Asset Identifiers
 
 *Note on versioning:* This describes the `Asset` (and associates) as used in XCM version of this document, and its version is strictly implied by the XCM it is used within. If it is necessary to form a `Asset` value that is used _outside_ of an XCM (where its version cannot be inferred) then the version-aware `VersionedAsset` should be used instead, exactly analogous to how `Xcm` relates to `VersionedXcm`.
@@ -1222,12 +1343,10 @@ Encoded as the tagged union of:
 - `ByFork = 1 { block_number: u64, block_hash: [u8; 32] }`: Network defined by the first 32-bytes of the hash and number of some block it contains.
 - `Polkadot = 2`: The Polkadot mainnet Relay-chain
 - `Kusama = 3`: The Kusama canary-net Relay-chain.
-- `Westend = 4`: The Westend testnet Relay-chain.
-- `Rococo = 5`: The Rococo testnet Relay-chain.
-- `Wococo = 6`: The Wococo testnet Relay-chain.
 - `Ethereum = 7 { chain_id: Compact<u64> }`: An Ethereum network specified by its EIP-155 chain ID.
 - `BitcoinCore = 8`: The Bitcoin network, including hard-forks supported by Bitcoin Core development team.
 - `BitcoinCash = 9`:  The Bitcoin network, including hard-forks supported by Bitcoin Cash developers.
+- `PolkadotBulletin = 10`: The Polkadot Bulletin chain.
 
 #### BodyId
 An identifier of a pluralistic body.
